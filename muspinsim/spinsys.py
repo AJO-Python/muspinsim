@@ -11,6 +11,7 @@ import scipy.constants as cnst
 from muspinsim.utils import Clonable
 from muspinsim.spinop import SpinOperator
 from muspinsim.hamiltonian import Hamiltonian
+from muspinsim.lindbladian import Lindbladian
 from muspinsim.constants import (gyromagnetic_ratio, spin, quadrupole_moment,
                                  EFG_2_MHZ)
 
@@ -67,6 +68,10 @@ class InteractionTerm(Clonable):
     def operator(self):
         return self._operator.clone()
 
+    @property
+    def matrix(self):
+        return self._operator.matrix
+
     def __repr__(self):
         return self.label
 
@@ -87,9 +92,7 @@ class SingleTerm(InteractionTerm):
         v = self._tensor
         v = np.dot(v, R.T)
 
-        rt = self.clone()
-        rt._tensor = v
-        rt._recalc_operator()
+        rt = SingleTerm(self._spinsys, self.i, v, self._label)
 
         return rt
 
@@ -118,9 +121,7 @@ class DoubleTerm(InteractionTerm):
         M = self._tensor
         M = np.linalg.multi_dot([R, M, R.T])
 
-        rt = self.clone()
-        rt._tensor = M
-        rt._recalc_operator()
+        rt = DoubleTerm(self._spinsys, self.i, self.j, M, self._label)
 
         return rt
 
@@ -129,6 +130,26 @@ class DoubleTerm(InteractionTerm):
                                                                 self.i,
                                                                 *self._tensor,
                                                                 self.j)
+
+
+class DissipationTerm(Clonable):
+
+    def __init__(self, operator, gamma=0.0):
+
+        self._op = operator
+        self._g = gamma
+
+    @property
+    def operator(self):
+        return self._op
+
+    @property
+    def gamma(self):
+        return self._g
+
+    @property
+    def tuple(self):
+        return (self._op, self._g)
 
 
 class SpinSystem(Clonable):
@@ -174,7 +195,7 @@ class SpinSystem(Clonable):
         self._operators = operators
 
         self._terms = []
-        self._dissip = np.zeros(len(spins))
+        self._dissip_terms = []
 
     @property
     def spins(self):
@@ -197,28 +218,8 @@ class SpinSystem(Clonable):
         return self._dim
 
     @property
-    def dissipation_factors(self):
-        return self._dissip.copy()
-
-    @property
     def is_dissipative(self):
-        return np.any(self._dissip != 0)
-
-    def set_dissipation(self, i, d=0.0):
-        """Set a dissipation factor for a spin.
-
-        Set a dissipation factor for a given spin, representing its coupling
-        (in MHz) with an external heat bath to include in the Lindbladian of
-        the system. 
-
-        Arguments:
-            i {int} -- Index of the spin
-
-        Keyword Arguments:
-            d {number} -- Dissipation factor in MHz (default: {0.0})
-        """
-
-        self._dissip[i] = d
+        return len(self._dissip_terms)
 
     def add_term(self, indices, tensor, label='Term'):
         """Add to the spin system a generic interaction term
@@ -419,6 +420,28 @@ class SpinSystem(Clonable):
 
         self._terms.remove(term)
 
+    def add_dissipative_term(self, op, d=0.0):
+        """Set a dissipation operator for the system.
+
+        Set a dissipation operator for this system, representing its coupling
+        (in MHz) with an external heat bath to include in the Lindbladian of
+        the system. 
+
+        Arguments:
+            op {SpinOperator} -- Operator for the dissipation term
+
+        Keyword Arguments:
+            d {number} -- Dissipation coupling in MHz (default: {0.0})
+        """
+
+        term = DissipationTerm(op, d)
+        self._dissip_terms.append(term)
+
+        return term
+
+    def remove_dissipative_term(self, term):
+        self._terms.remove(term)
+
     def gamma(self, i):
         """Returns the gyromagnetic ratio of a given particle
 
@@ -481,12 +504,17 @@ class SpinSystem(Clonable):
 
     def rotate(self, rotmat=np.eye(3)):
 
+        # Trying to avoid pointlessly cloning the terms
+        terms = self._terms
+        self._terms = []
+
         # Make a clone
         rssys = self.clone()
+        self._terms = terms
 
         # Edit the terms
         try:
-            rssys._terms = [t.rotate(rotmat) for t in rssys._terms]
+            rssys._terms = [t.rotate(rotmat) for t in terms]
         except AttributeError:
             raise RuntimeError('Can only rotate SpinSystems containing Single'
                                ' or Double terms')
@@ -499,10 +527,19 @@ class SpinSystem(Clonable):
         if len(self._terms) == 0:
             H = np.eye(np.prod(self.dimension))
         else:
-            H = np.sum([t.operator.matrix for t in self._terms], axis=0)
+            H = np.sum([t.matrix for t in self._terms], axis=0)
         H = Hamiltonian(H, dim=self.dimension)
 
         return H
+
+    @property
+    def lindbladian(self):
+
+        H = self.hamiltonian
+        dops = [t.tuple for t in self._dissip_terms]
+        L = Lindbladian.from_hamiltonian(H, dops)
+
+        return L
 
     def __len__(self):
         return len(self._gammas)
